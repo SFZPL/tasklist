@@ -196,7 +196,7 @@ def get_recaps(models, uid, date_domain: List) -> List[Dict[str, Any]]:
     fields_to_read = [
         'create_uid',
         'x_studio_shift',
-        'x_studio_recap_cat',
+       # 'x_studio_recap_cat',
         'x_studio_designer_summary',
         'create_date',
         'x_studio_parent_task',
