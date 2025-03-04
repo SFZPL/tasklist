@@ -200,7 +200,7 @@ def get_recaps(models, uid, date_domain: List) -> List[Dict[str, Any]]:
         'x_studio_designer_summary',
         'create_date',
         'x_studio_parent_task',
-        'x_studio_sub_task'
+        'x_studio_subtask'
     ]
     try:
         recs = models.execute_kw(
