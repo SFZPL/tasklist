@@ -5,14 +5,13 @@ import xmlrpc.client
 import streamlit as st
 from dotenv import load_dotenv
 from docx import Document
-from datetime import datetime, time, date
+from datetime import datetime, time, timedelta, date
 from typing import Tuple, Optional, List, Dict, Any
 
 # =========================================
 # Load Environment Variables and Set Up Odoo
 # =========================================
 load_dotenv()
-
 ODOO_URL = st.secrets["odoo"]["ODOO_URL"]
 ODOO_DB = st.secrets["odoo"]["ODOO_DB"]
 ODOO_USERNAME = st.secrets["odoo"]["ODOO_USERNAME"]
@@ -55,11 +54,25 @@ def get_field_name(many2one_val: Any) -> str:
     return ""
 
 def format_datetime_range(start_dt_str: str, end_dt_str: str) -> str:
-    if not start_dt_str and not end_dt_str:
-        return ""
-    if not end_dt_str:
-        return start_dt_str
-    return f"{start_dt_str} -> {end_dt_str}"
+    """Converts times (assumed GMT) to GMT+3 and returns the formatted range."""
+    try:
+        if start_dt_str:
+            dt_start = datetime.strptime(start_dt_str, "%Y-%m-%d %H:%M:%S") + timedelta(hours=3)
+            start_fmt = dt_start.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            start_fmt = ""
+        if end_dt_str:
+            dt_end = datetime.strptime(end_dt_str, "%Y-%m-%d %H:%M:%S") + timedelta(hours=3)
+            end_fmt = dt_end.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            end_fmt = ""
+    except Exception:
+        # Fallback to original strings if parsing fails.
+        start_fmt = start_dt_str
+        end_fmt = end_dt_str
+    if not end_fmt:
+        return start_fmt
+    return f"{start_fmt} -> {end_fmt}"
 
 # =========================================
 # (A) MORNING TASK LIST (from planning.slot)
@@ -140,13 +153,16 @@ def build_morning_text(task: Dict[str, Any], subtask_map: Dict[int, Dict[str, An
             sub_id = sub_val[0] if isinstance(sub_val, list) and len(sub_val) > 0 else None
             if sub_id and sub_id in subtask_map:
                 sub_rec = subtask_map[sub_id]
+                # Format service category: if it's a many2one, extract the second element
                 sc = sub_rec.get('x_studio_service_category_1', '')
+                if isinstance(sc, list):
+                    sc = get_field_name(sc)
                 units = sub_rec.get('x_studio_total_no_of_design_units_sc1', '')
                 if sc:
                     lines.append(f"Service Category: {sc}")
                 if units:
                     lines.append(f"No. of Units: {units}")
-    # Date Range
+    # Date Range (convert to GMT+3)
     start_dt_str = task.get('start_datetime') or ""
     end_dt_str = task.get('end_datetime') or ""
     drange = format_datetime_range(start_dt_str, end_dt_str)
@@ -158,8 +174,8 @@ def create_morning_table(doc: Document,
                          tasks_by_designer: Dict[str, List[Dict[str, Any]]],
                          subtask_map: Dict[int, Dict[str, Any]]) -> bytes:
     """
-    Single table with 2 columns, but each designer gets only one row.
-    The second column concatenates the text for all tasks of that designer.
+    Creates a 2-column table with one row per designer.
+    The second column concatenates all tasks (sorted by start time) for that designer.
     """
     doc.add_heading("Morning Task List", level=1)
     table = doc.add_table(rows=1, cols=2)
@@ -170,24 +186,20 @@ def create_morning_table(doc: Document,
     hdr_cells[0].text = "Designer"
     hdr_cells[1].text = "Task Details"
     
+    # For each designer, sort tasks by start_datetime (earlier first)
     for designer, tasks in tasks_by_designer.items():
-        # Create a single row for this designer
+        try:
+            tasks.sort(key=lambda t: datetime.strptime(t.get('start_datetime', "1970-01-01 00:00:00"), "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass  # In case of parsing error, leave unsorted.
         row_cells = table.add_row().cells
         row_cells[0].text = designer
-        
-        # Build a multiline text that contains all tasks
-        all_tasks_texts = []
-        for task in tasks:
-            single_task_text = build_morning_text(task, subtask_map)
-            all_tasks_texts.append(single_task_text)
-        
-        # Separate each task's text with a blank line (or a bullet, etc.)
-        row_cells[1].text = "\n\n".join(all_tasks_texts)
+        task_texts = [build_morning_text(task, subtask_map) for task in tasks]
+        row_cells[1].text = "\n\n".join(task_texts)
     
-    output_stream = io.BytesIO()
-    doc.save(output_stream)
-    return output_stream.getvalue()
-
+    out_stream = io.BytesIO()
+    doc.save(out_stream)
+    return out_stream.getvalue()
 
 # =========================================
 # (B) RECAP from x_recaps (Unchanged)
@@ -196,7 +208,7 @@ def get_recaps(models, uid, date_domain: List) -> List[Dict[str, Any]]:
     fields_to_read = [
         'create_uid',
         'x_studio_shift',
-       # 'x_studio_recap_cat',
+        'x_studio_recap_cat',
         'x_studio_designer_summary',
         'create_date',
         'x_studio_parent_task',
@@ -219,9 +231,9 @@ def build_recap_notes_text(rec: Dict[str, Any]) -> str:
     pt_val = rec.get('x_studio_parent_task')
     if isinstance(pt_val, list) and len(pt_val) > 1:
         lines.append(f"Parent Task: {pt_val[1]}")
-    st_val = rec.get('x_studio_sub_task')
-    if isinstance(st_val, list) and len(st_val) > 1:
-        lines.append(f"Sub Task: {st_val[1]}")
+    st_val = rec.get('x_studio_subtask')
+    if st_val:
+        lines.append(f"Sub Task: {st_val}")
     shift = rec.get('x_studio_shift', '')
     if shift:
         lines.append(f"Shift: {shift}")
@@ -283,25 +295,25 @@ def main():
         page_icon=":clipboard:",
         layout="centered"
     )
-    st.title("Task Exctraction Tool")
+    st.title("Task Extraction Tool")
     
     uid, models = get_odoo_connection()
     if not uid:
         st.stop()
 
     report_type = st.selectbox("Select Report Type", ["Morning Task List", "Recap"])
+    
     st.subheader("Select Date Range")
     start_date = st.date_input("Start Date", value=datetime.today())
     end_date = st.date_input("End Date", value=datetime.today())
+    # For planning.slot, filter on start_datetime; for recaps, on create_date
     start_dt_str = datetime.combine(start_date, time(0, 0, 0)).strftime("%Y-%m-%d %H:%M:%S")
     end_dt_str = datetime.combine(end_date, time(23, 59, 59)).strftime("%Y-%m-%d %H:%M:%S")
     
     if report_type == "Morning Task List":
         st.write("Optional: Select Favorites for planning.slot.")
         all_favs = get_planning_favorites(models, uid)
-        if not all_favs:
-            all_favs = []
-        fav_names = [f["name"] for f in all_favs]
+        fav_names = [f["name"] for f in all_favs] if all_favs else []
         selected_favs = st.multiselect("Select Favorites (optional)", fav_names)
         
         if st.button("Fetch & Generate Morning Tasks"):
@@ -317,15 +329,23 @@ def main():
                 ('start_datetime', '>=', start_dt_str),
                 ('start_datetime', '<=', end_dt_str)
             ]
-            final_domain = ['&'] + date_domain + combined_fav_domain if combined_fav_domain else date_domain
+            final_domain = (['&'] + date_domain + combined_fav_domain) if combined_fav_domain else date_domain
             tasks = get_tasks(models, uid, final_domain)
             if tasks:
                 st.success(f"Fetched {len(tasks)} tasks from planning.slot!")
+                # Group tasks by designer and sort them by start_datetime (earlier first)
                 tasks_by_designer = {}
                 for t in tasks:
                     res = t.get('resource_id')
                     designer = res[1] if (res and isinstance(res, list) and len(res) > 1) else "Unassigned"
                     tasks_by_designer.setdefault(designer, []).append(t)
+                for designer in tasks_by_designer:
+                    try:
+                        tasks_by_designer[designer].sort(
+                            key=lambda t: datetime.strptime(t.get('start_datetime', "1970-01-01 00:00:00"), "%Y-%m-%d %H:%M:%S")
+                        )
+                    except Exception:
+                        pass
                 subtask_ids = []
                 for t in tasks:
                     sub_val = t.get('x_studio_sub_task_1')
@@ -342,15 +362,11 @@ def main():
                 )
             else:
                 st.error("No tasks found with the selected filters (Morning).")
-                
     else:
-        # Recap (x_recaps) branch
+        # Recap (x_recaps) branch remains unchanged
         st.write("Optional: Select Favorites for Recaps (filter by creator).")
-        # Use the same favorites from planning.slot to filter employees.
         all_favs = get_planning_favorites(models, uid)
-        if not all_favs:
-            all_favs = []
-        fav_names = [f["name"] for f in all_favs]
+        fav_names = [f["name"] for f in all_favs] if all_favs else []
         selected_favs = st.multiselect("Select Favorites (optional)", fav_names)
         fav_domains = []
         for fav in selected_favs:
@@ -359,7 +375,6 @@ def main():
                 d = parse_domain(rec.get("domain", "[]"))
                 if d:
                     fav_domains.append(d)
-        # Get employee names from hr.employee that match the selected favorites
         allowed_emp_names = get_employees_from_favorites(models, uid, fav_domains) if fav_domains else None
         
         if st.button("Fetch & Generate Recap from x_recaps"):
@@ -369,19 +384,18 @@ def main():
             ]
             recs = get_recaps(models, uid, recap_domain)
             if recs:
-                # Group recaps by create_uid, but filter by allowed employee names if provided.
                 recs_by_designer = {}
                 for r in recs:
                     c_uid = r.get('create_uid')
                     designer_name = c_uid[1] if (isinstance(c_uid, list) and len(c_uid) > 1) else "Unassigned"
                     if allowed_emp_names is not None and designer_name not in allowed_emp_names:
-                        continue  # skip recaps not from allowed employees
+                        continue
                     recs_by_designer.setdefault(designer_name, []).append(r)
                 if recs_by_designer:
                     doc = Document()
                     doc_bytes = create_recap_notes_table(doc, recs_by_designer)
                     st.download_button(
-                        label="Download x_recaps Report",
+                        label="Download Recap Report",
                         data=doc_bytes,
                         file_name="Recap.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
